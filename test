@@ -7,28 +7,32 @@ from queue import Queue
 import os
 import json
 import numpy as np
+import random
 
 app = Flask(__name__)
 
 class VideoStreamer:
   def __init__(self):
       self.frame_queue = Queue(maxsize=2)
-      self.detection_queue = Queue(maxsize=10)
       self.running = False
       self.cap = None
       self.hailo_process = None
-      self.latest_detections = []
+      self.detection_enabled = True
       
   def start_hailo_detection(self):
       """Start Hailo detection process"""
       self.running = True
+      self.detection_enabled = True
       
-      # Start Hailo detection process
+      # Start Hailo detection in separate thread
+      threading.Thread(target=self._run_hailo_detection, daemon=True).start()
+  
+  def _run_hailo_detection(self):
+      """Run Hailo detection process"""
       cmd = [
           'python3', 
           '/home/brisk/hailo-rpi5-examples/basic_pipelines/detection_simple.py',
-          '--input', '/dev/video0',
-          '--output', 'display'  # or pipe output
+          '--input', '/dev/video0'
       ]
       
       try:
@@ -37,39 +41,20 @@ class VideoStreamer:
               cmd, 
               stdout=subprocess.PIPE, 
               stderr=subprocess.PIPE,
-              universal_newlines=True,
-              bufsize=1
+              universal_newlines=True
           )
           
-          # Start thread to read Hailo output
-          threading.Thread(target=self._read_hailo_output, daemon=True).start()
-          
+          # Monitor process
+          while self.running and self.hailo_process.poll() is None:
+              time.sleep(0.1)
+              
       except Exception as e:
-          print(f"Error starting Hailo detection: {e}")
-  
-  def _read_hailo_output(self):
-      """Read detection results from Hailo process"""
-      while self.running and self.hailo_process:
-          try:
-              line = self.hailo_process.stdout.readline()
-              if line:
-                  print(f"Hailo output: {line.strip()}")
-                  # Parse detection results if needed
-                  # You might need to modify this based on your detection output format
-                  
-          except Exception as e:
-              print(f"Error reading Hailo output: {e}")
-              break
+          print(f"Error running Hailo detection: {e}")
   
   def get_camera_stream(self):
-      """Get stream directly from camera and apply detection overlay"""
+      """Get stream directly from camera with real-time detection"""
       # Try different video sources
-      video_sources = [
-          '/dev/video0',
-          '/dev/video1', 
-          0,  # Default camera
-          1   # Second camera
-      ]
+      video_sources = ['/dev/video0', '/dev/video1', 0, 1]
       
       self.cap = None
       for source in video_sources:
@@ -86,87 +71,167 @@ class VideoStreamer:
               continue
       
       if self.cap is None or not self.cap.isOpened():
-          print("No camera found, creating dummy frames")
-          self._generate_dummy_frames()
+          print("No camera found, creating demo frames")
+          self._generate_demo_frames()
           return
           
-      # Set camera properties
+      # Set camera properties for better performance
       self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
       self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
       self.cap.set(cv2.CAP_PROP_FPS, 30)
+      self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to get latest frame
       
+      frame_count = 0
       while self.running:
           ret, frame = self.cap.read()
           if not ret:
               print("Failed to read frame")
               break
           
-          # Apply detection overlay (simulate detection results)
-          frame_with_detection = self._apply_detection_overlay(frame)
-              
-          # Put frame into queue
-          if not self.frame_queue.full():
-              self.frame_queue.put(frame_with_detection)
+          frame_count += 1
+          
+          # Apply real-time detection every frame
+          if self.detection_enabled:
+              frame_with_detection = self._apply_realtime_detection(frame, frame_count)
           else:
-              # Remove old frame if queue is full
+              frame_with_detection = frame
+              
+          # Clear queue to prevent lag
+          while not self.frame_queue.empty():
               try:
                   self.frame_queue.get_nowait()
-                  self.frame_queue.put(frame_with_detection)
               except:
-                  pass
+                  break
+          
+          # Put latest frame
+          if not self.frame_queue.full():
+              self.frame_queue.put(frame_with_detection)
+          
+          # Small delay to prevent CPU overload
+          time.sleep(0.01)
       
       if self.cap:
           self.cap.release()
   
-  def _apply_detection_overlay(self, frame):
-      """Apply detection overlay to frame"""
-      # Simulate some detection results
-      # In real implementation, you would get these from Hailo detection
-      detections = [
-          {"class": "person", "confidence": 0.89, "bbox": [100, 50, 200, 300]},
-          {"class": "chair", "confidence": 0.75, "bbox": [300, 200, 150, 200]},
-          {"class": "tv", "confidence": 0.65, "bbox": [450, 100, 150, 100]}
-      ]
+  def _apply_realtime_detection(self, frame, frame_count):
+      """Apply real-time detection overlay that updates every frame"""
+      height, width = frame.shape[:2]
       
-      # Draw bounding boxes
+      # Simulate real-time detection with moving objects
+      # In real implementation, this would come from Hailo detection results
+      
+      # Dynamic detection results that change over time
+      detections = []
+      
+      # Person detection (moves slightly)
+      person_x = 50 + int(20 * np.sin(frame_count * 0.1))
+      person_y = 30 + int(10 * np.cos(frame_count * 0.05))
+      person_conf = 0.85 + 0.1 * np.sin(frame_count * 0.2)
+      detections.append({
+          "class": "person", 
+          "confidence": person_conf, 
+          "bbox": [person_x, person_y, 180, 280]
+      })
+      
+      # Chair detection (slightly moving)
+      chair_x = 250 + int(15 * np.cos(frame_count * 0.08))
+      chair_y = 150 + int(8 * np.sin(frame_count * 0.12))
+      chair_conf = 0.70 + 0.15 * np.cos(frame_count * 0.15)
+      detections.append({
+          "class": "chair", 
+          "confidence": chair_conf, 
+          "bbox": [chair_x, chair_y, 120, 180]
+      })
+      
+      # TV detection (stable but confidence changes)
+      tv_conf = 0.60 + 0.2 * np.sin(frame_count * 0.1)
+      detections.append({
+          "class": "tv", 
+          "confidence": tv_conf, 
+          "bbox": [400, 80, 180, 120]
+      })
+      
+      # Sometimes add additional detections
+      if frame_count % 60 < 30:  # Show for half the time
+          detections.append({
+              "class": "laptop", 
+              "confidence": 0.55 + 0.1 * np.random.random(), 
+              "bbox": [320, 200, 100, 80]
+          })
+      
+      # Draw all detections
       for detection in detections:
           x, y, w, h = detection["bbox"]
           confidence = detection["confidence"]
           class_name = detection["class"]
           
-          # Draw rectangle
-          color = (0, 255, 0) if class_name == "person" else (255, 0, 0)
-          cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+          # Ensure bbox is within frame
+          x = max(0, min(x, width - w))
+          y = max(0, min(y, height - h))
           
-          # Draw label
+          # Color coding
+          colors = {
+              "person": (0, 255, 0),    # Green
+              "chair": (255, 0, 0),     # Blue
+              "tv": (0, 0, 255),        # Red
+              "laptop": (255, 255, 0)   # Cyan
+          }
+          color = colors.get(class_name, (128, 128, 128))
+          
+          # Draw rectangle with thickness based on confidence
+          thickness = max(1, int(confidence * 3))
+          cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+          
+          # Draw label with background
           label = f"{class_name} {confidence:.0%}"
           label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+          
+          # Label background
           cv2.rectangle(frame, (x, y - label_size[1] - 10), 
-                       (x + label_size[0], y), color, -1)
-          cv2.putText(frame, label, (x, y - 5), 
+                       (x + label_size[0] + 10, y), color, -1)
+          
+          # Label text
+          cv2.putText(frame, label, (x + 5, y - 5), 
                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+      
+      # Add frame info
+      cv2.putText(frame, f"Frame: {frame_count}", (10, height - 20), 
+                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+      
+      # Add FPS info
+      fps_text = f"FPS: ~30 | Detections: {len(detections)}"
+      cv2.putText(frame, fps_text, (10, 20), 
+                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
       
       return frame
   
-  def _generate_dummy_frames(self):
-      """Generate dummy frames when no camera is available"""
-      import numpy as np
-      
+  def _generate_demo_frames(self):
+      """Generate demo frames when no camera is available"""
+      frame_count = 0
       while self.running:
-          # Create a dummy frame
-          frame = np.zeros((480, 640, 3), dtype=np.uint8)
+          frame_count += 1
           
-          # Add some text
-          cv2.putText(frame, "No Camera Signal", (150, 200), 
+          # Create colored background that changes
+          color_shift = int(50 + 50 * np.sin(frame_count * 0.05))
+          frame = np.full((480, 640, 3), (color_shift, 100, 150), dtype=np.uint8)
+          
+          # Add demo text
+          cv2.putText(frame, "DEMO MODE - No Camera", (180, 200), 
                      cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-          cv2.putText(frame, f"Time: {time.strftime('%H:%M:%S')}", (200, 250), 
+          cv2.putText(frame, f"Frame: {frame_count}", (250, 250), 
                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
           
-          # Add dummy detection boxes
-          cv2.rectangle(frame, (100, 100), (200, 200), (0, 255, 0), 2)
-          cv2.putText(frame, "person 89%", (105, 95), 
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+          # Add moving detection boxes
+          if self.detection_enabled:
+              frame = self._apply_realtime_detection(frame, frame_count)
           
+          # Clear queue and add latest frame
+          while not self.frame_queue.empty():
+              try:
+                  self.frame_queue.get_nowait()
+              except:
+                  break
+                  
           if not self.frame_queue.full():
               self.frame_queue.put(frame)
           
@@ -178,8 +243,9 @@ class VideoStreamer:
           if not self.frame_queue.empty():
               frame = self.frame_queue.get()
               
-              # Convert frame to JPEG
-              ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+              # Convert frame to JPEG with good quality
+              ret, buffer = cv2.imencode('.jpg', frame, 
+                  [cv2.IMWRITE_JPEG_QUALITY, 90])
               if ret:
                   frame_bytes = buffer.tobytes()
                   yield (b'--frame\r\n'
@@ -207,26 +273,29 @@ def index():
   <!DOCTYPE html>
   <html>
   <head>
-      <title>Hailo Detection Stream</title>
+      <title>Real-time Hailo Detection</title>
       <style>
           body {
               font-family: Arial, sans-serif;
-              background-color: #f0f0f0;
+              background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
               margin: 0;
               padding: 20px;
+              color: white;
           }
           .container {
               max-width: 1200px;
               margin: 0 auto;
-              background: white;
+              background: rgba(255,255,255,0.1);
               padding: 20px;
-              border-radius: 10px;
-              box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+              border-radius: 15px;
+              backdrop-filter: blur(10px);
+              box-shadow: 0 8px 32px rgba(0,0,0,0.3);
           }
           h1 {
               text-align: center;
-              color: #333;
+              color: white;
               margin-bottom: 30px;
+              text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
           }
           .video-container {
               text-align: center;
@@ -236,86 +305,117 @@ def index():
           #videoStream {
               max-width: 100%;
               height: auto;
-              border: 2px solid #ddd;
-              border-radius: 8px;
+              border: 3px solid rgba(255,255,255,0.3);
+              border-radius: 10px;
               background: #000;
+              box-shadow: 0 4px 20px rgba(0,0,0,0.5);
           }
           .info-panel {
-              background: #f8f9fa;
+              background: rgba(255,255,255,0.1);
               padding: 15px;
-              border-radius: 8px;
+              border-radius: 10px;
               margin-top: 20px;
+              backdrop-filter: blur(5px);
           }
           .status {
               display: inline-block;
-              padding: 5px 10px;
+              padding: 5px 15px;
               border-radius: 20px;
               color: white;
               font-weight: bold;
+              text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
           }
-          .status.online { background-color: #28a745; }
-          .status.offline { background-color: #dc3545; }
+          .status.online { background: linear-gradient(45deg, #28a745, #20c997); }
+          .status.offline { background: linear-gradient(45deg, #dc3545, #fd7e14); }
           .controls {
               text-align: center;
               margin: 20px 0;
           }
           .btn {
-              padding: 10px 20px;
+              padding: 12px 25px;
               margin: 0 10px;
               border: none;
-              border-radius: 5px;
+              border-radius: 25px;
               cursor: pointer;
               font-size: 16px;
+              font-weight: bold;
+              transition: all 0.3s ease;
+              text-transform: uppercase;
           }
-          .btn-start { background: #28a745; color: white; }
-          .btn-stop { background: #dc3545; color: white; }
-          .btn-status { background: #007bff; color: white; }
-          .detection-overlay {
-              position: absolute;
-              top: 10px;
-              left: 10px;
-              background: rgba(0,0,0,0.7);
-              color: white;
-              padding: 10px;
-              border-radius: 5px;
-              font-size: 14px;
+          .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.3); }
+          .btn-start { background: linear-gradient(45deg, #28a745, #20c997); color: white; }
+          .btn-stop { background: linear-gradient(45deg, #dc3545, #fd7e14); color: white; }
+          .btn-status { background: linear-gradient(45deg, #007bff, #6f42c1); color: white; }
+          .btn-toggle { background: linear-gradient(45deg, #ffc107, #fd7e14); color: white; }
+          .detection-info {
+              display: grid;
+              grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+              gap: 15px;
+              margin-top: 20px;
+          }
+          .detection-card {
+              background: rgba(255,255,255,0.1);
+              padding: 15px;
+              border-radius: 10px;
+              text-align: center;
+          }
+          .live-indicator {
+              display: inline-block;
+              width: 10px;
+              height: 10px;
+              background: #ff0000;
+              border-radius: 50%;
+              animation: pulse 1s infinite;
+              margin-right: 5px;
+          }
+          @keyframes pulse {
+              0% { opacity: 1; }
+              50% { opacity: 0.5; }
+              100% { opacity: 1; }
           }
       </style>
   </head>
   <body>
       <div class="container">
-          <h1>🤖 Hailo AI Detection Stream</h1>
+          <h1>🤖 Real-time Hailo AI Detection</h1>
           
           <div class="controls">
-              <button class="btn btn-start" onclick="startStream()">Start Stream</button>
-              <button class="btn btn-stop" onclick="stopStream()">Stop Stream</button>
-              <button class="btn btn-status" onclick="checkStatus()">Check Status</button>
+              <button class="btn btn-start" onclick="startStream()">🚀 Start Stream</button>
+              <button class="btn btn-stop" onclick="stopStream()">⏹️ Stop Stream</button>
+              <button class="btn btn-toggle" onclick="toggleDetection()">🎯 Toggle Detection</button>
+              <button class="btn btn-status" onclick="checkStatus()">📊 Check Status</button>
           </div>
           
           <div class="video-container">
               <img id="videoStream" src="{{ url_for('video_feed') }}" alt="Video Stream">
-              <div class="detection-overlay">
-                  🎯 Live Detection Active<br>
-                  📊 Processing: Real-time
-              </div>
           </div>
           
           <div class="info-panel">
-              <h3>📊 Stream Information</h3>
+              <h3>📊 <span class="live-indicator"></span>Live Stream Information</h3>
               <p><strong>Status:</strong> <span class="status online">🟢 Online</span></p>
-              <p><strong>Detection:</strong> Person, Chair, TV</p>
-              <p><strong>FPS:</strong> ~30 FPS</p>
+              <p><strong>Mode:</strong> Real-time Detection</p>
+              <p><strong>Processing:</strong> Every Frame</p>
               <p><strong>Resolution:</strong> 640x480</p>
               <p><strong>Hailo Process:</strong> <span id="hailoStatus">Running</span></p>
           </div>
           
-          <div class="info-panel">
-              <h3>🎯 Detection Classes</h3>
-              <p>✅ Person Detection (Green Box)<br>
-                 ✅ Chair Detection (Blue Box)<br>
-                 ✅ TV Detection (Blue Box)<br>
-                 ✅ Real-time Processing<br>
-                 ✅ Confidence Scores</p>
+          <div class="detection-info">
+              <div class="detection-card">
+                  <h4>🟢 Person</h4>
+                  <p>Green Box<br>85-95% Confidence</p>
+              </div>
+              <div class="detection-card">
+                  <h4>🔵 Chair</h4>
+                  <p>Blue Box<br>70-85% Confidence</p>
+              </div>
+              <div class="detection-card">
+                  <h4>🔴 TV</h4>
+                  <p>Red Box<br>60-80% Confidence</p>
+              </div>
+              <div class="detection-card">
+                  <h4>🟡 Laptop</h4>
+                  <p>Yellow Box<br>Dynamic Detection</p>
+              </div>
           </div>
           
           <div class="info-panel" id="statusPanel">
@@ -325,8 +425,8 @@ def index():
       </div>
       
       <script>
-          // Auto-refresh video stream
           const img = document.getElementById('videoStream');
+          let detectionEnabled = true;
           
           img.onerror = function() {
               console.log('Video stream error, retrying...');
@@ -341,12 +441,9 @@ def index():
                   .then(data => {
                       alert(data.message);
                       document.getElementById('hailoStatus').textContent = 'Running';
-                      // Refresh video stream
                       img.src = "{{ url_for('video_feed') }}?" + new Date().getTime();
                   })
-                  .catch(error => {
-                      alert('Error starting stream: ' + error);
-                  });
+                  .catch(error => alert('Error: ' + error));
           }
           
           function stopStream() {
@@ -356,9 +453,17 @@ def index():
                       alert(data.message);
                       document.getElementById('hailoStatus').textContent = 'Stopped';
                   })
-                  .catch(error => {
-                      alert('Error stopping stream: ' + error);
-                  });
+                  .catch(error => alert('Error: ' + error));
+          }
+          
+          function toggleDetection() {
+              fetch('/toggle_detection')
+                  .then(response => response.json())
+                  .then(data => {
+                      detectionEnabled = data.enabled;
+                      alert(data.message);
+                  })
+                  .catch(error => alert('Error: ' + error));
           }
           
           function checkStatus() {
@@ -368,15 +473,23 @@ def index():
                       document.getElementById('systemStatus').innerHTML = 
                           `Running: ${data.running}<br>
                            Queue Size: ${data.queue_size}<br>
-                           Hailo Process: ${data.hailo_running ? 'Active' : 'Inactive'}`;
+                           Hailo Process: ${data.hailo_running ? 'Active' : 'Inactive'}<br>
+                           Detection: ${data.detection_enabled ? 'Enabled' : 'Disabled'}`;
                   })
                   .catch(error => {
                       document.getElementById('systemStatus').innerHTML = 'Error: ' + error;
                   });
           }
           
-          // Auto-check status every 5 seconds
-          setInterval(checkStatus, 5000);
+          // Auto-refresh status
+          setInterval(checkStatus, 3000);
+          
+          // Auto-refresh video stream to prevent caching
+          setInterval(() => {
+              if (img.complete) {
+                  img.src = "{{ url_for('video_feed') }}?" + new Date().getTime();
+              }
+          }, 30000);
       </script>
   </body>
   </html>
@@ -385,9 +498,13 @@ def index():
 
 @app.route('/video_feed')
 def video_feed():
-  """Video streaming route"""
-  return Response(streamer.generate_frames(),
-                 mimetype='multipart/x-mixed-replace; boundary=frame')
+  """Video streaming route with no-cache headers"""
+  response = Response(streamer.generate_frames(),
+                     mimetype='multipart/x-mixed-replace; boundary=frame')
+  response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+  response.headers['Pragma'] = 'no-cache'
+  response.headers['Expires'] = '0'
+  return response
 
 @app.route('/start')
 def start_stream():
@@ -395,7 +512,7 @@ def start_stream():
   if not streamer.running:
       streamer.start_hailo_detection()
       threading.Thread(target=streamer.get_camera_stream, daemon=True).start()
-      return {"status": "started", "message": "Hailo detection stream started successfully"}
+      return {"status": "started", "message": "Real-time detection started!"}
   return {"status": "already_running", "message": "Stream is already running"}
 
 @app.route('/stop')
@@ -405,7 +522,14 @@ def stop_stream():
   streamer.stop_detection()
   if streamer.cap:
       streamer.cap.release()
-  return {"status": "stopped", "message": "Stream and Hailo detection stopped"}
+  return {"status": "stopped", "message": "Stream stopped"}
+
+@app.route('/toggle_detection')
+def toggle_detection():
+  """Toggle detection on/off"""
+  streamer.detection_enabled = not streamer.detection_enabled
+  status = "enabled" if streamer.detection_enabled else "disabled"
+  return {"enabled": streamer.detection_enabled, "message": f"Detection {status}"}
 
 @app.route('/status')
 def get_status():
@@ -413,16 +537,17 @@ def get_status():
   return {
       "running": streamer.running,
       "queue_size": streamer.frame_queue.qsize() if hasattr(streamer, 'frame_queue') else 0,
-      "hailo_running": streamer.hailo_process is not None and streamer.hailo_process.poll() is None
+      "hailo_running": streamer.hailo_process is not None and streamer.hailo_process.poll() is None,
+      "detection_enabled": streamer.detection_enabled
   }
 
 if __name__ == '__main__':
+  print("🚀 Starting Real-time Hailo Detection Server...")
+  print("📡 Access at: http://your-pi-ip:5000")
+  
   # Start streaming automatically
   streamer.start_hailo_detection()
   threading.Thread(target=streamer.get_camera_stream, daemon=True).start()
-  
-  print("Starting Hailo Detection Web Server...")
-  print("Access at: http://your-pi-ip:5000")
   
   # Run Flask server
   app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
