@@ -1,0 +1,223 @@
+import os
+from pathlib import Path
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
+import hailo
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callback_class
+from hailo_apps.hailo_app_python.apps.detection_simple.pipeline_smartfarm import GStreamerDetectionApp
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import threading
+import time
+
+SAVE_PATH_TOPVIEW = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_result_topview"
+SAVE_PATH_SIDEVIEW = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_result_sideview"
+
+os.makedirs(SAVE_PATH_TOPVIEW, exist_ok=True)
+os.makedirs(SAVE_PATH_SIDEVIEW, exist_ok=True)
+
+class user_app_callback_class(app_callback_class):
+    def __init__(self, source_type="topview"):
+        super().__init__()
+        self.source_type = source_type
+        self.detection_count = 0
+
+    def get_source_type(self):
+        return self.source_type
+
+    def increment_detection(self):
+        self.detection_count += 1
+
+    def get_detection_count(self):
+        return self.detection_count
+
+def create_app_callback(source_type):
+    def app_callback(pad, info, user_data):
+        user_data.increment()
+        frame_count = user_data.get_count()
+        source = user_data.get_source_type()
+        
+        string_to_print = f" [{source.upper()}] Frame count: {frame_count}\n"
+        buffer = info.get_buffer()
+        
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        
+        detections = hailo.get_roi_from_buffer(buffer).get_objects_typed(hailo.HAILO_DETECTION)
+        
+        if detections:
+            caps = pad.get_current_caps()
+            structure = caps.get_structure(0)
+            width = structure.get_value("width")
+            height = structure.get_value("height")
+            data = buffer.extract_dup(0, buffer.get_size())
+            
+            np_image = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+            image = Image.fromarray(np_image)
+            draw = ImageDraw.Draw(image)
+            
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+            except:
+                font = ImageFont.load_default()
+            
+            detection_info = []
+            for detection in detections:
+                bbox = detection.get_bbox()
+                label = detection.get_label()
+                confidence = detection.get_confidence()
+                
+                x1 = int(bbox.xmin() * width)
+                y1 = int(bbox.ymin() * height)
+                x2 = int(bbox.xmax() * width)
+                y2 = int(bbox.ymax() * height)
+                
+                color = "blue" if source == "topview" else "red"
+                
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+                
+                text = f"{label} {confidence:.0%}"
+                
+                bbox_text = draw.textbbox((0, 0), text, font=font)
+                text_width = bbox_text[2] - bbox_text[0]
+                text_height = bbox_text[3] - bbox_text[1]
+                
+                text_y = max(y1 - text_height - 5, 0)
+                draw.rectangle([x1, text_y, x1 + text_width + 10, text_y + text_height + 5], fill=color)
+                
+                draw.text((x1 + 5, text_y + 2), text, fill="white", font=font)
+                
+                detection_info.append({
+                    'label': label,
+                    'confidence': confidence,
+                    'bbox': (x1, y1, x2, y2)
+                })
+                
+                string_to_print += (f"🎯 Detection: {label} Confidence: {confidence:.2f} "
+                                  f"Box: ({x1},{y1},{x2},{y2})\n")
+            
+            save_path = SAVE_PATH_TOPVIEW if source == "topview" else SAVE_PATH_SIDEVIEW
+            image_path = os.path.join(save_path, f"result_{source}_{frame_count}.jpg")
+            image.save(image_path)
+            
+            user_data.increment_detection()
+            string_to_print += f" Image saved to: {image_path}\n"
+            string_to_print += f" Total detections for {source}: {user_data.get_detection_count()}\n"
+            print(string_to_print)
+        else:
+            print(f"📸 [{source.upper()}] Frame count: {frame_count} - ❌ No detections")
+        
+        return Gst.PadProbeReturn.OK
+    
+    return app_callback
+
+class DualSourceDetectionApp:
+    def __init__(self):
+        self.topview_app = None
+        self.sideview_app = None
+        self.topview_thread = None
+        self.sideview_thread = None
+        
+        project_root = Path(__file__).resolve().parent.parent
+        env_file = project_root / ".env"
+        env_path_str = str(env_file)
+        os.environ["HAILO_ENV_FILE"] = env_path_str
+
+    def run_topview(self):
+        print(" Starting TOPVIEW detection...")
+        try:
+            user_data = user_app_callback_class("topview")
+            topview_callback = create_app_callback("topview")
+            self.topview_app = GStreamerDetectionApp(topview_callback, user_data)
+
+            self.topview_app.source_type = "topview"
+            self.topview_app.run()
+        except Exception as e:
+            print(f"❌ Error in topview detection: {e}")
+
+    def run_sideview(self):
+        print(" Starting SIDEVIEW detection...")
+        try:
+            user_data = user_app_callback_class("sideview")
+            sideview_callback = create_app_callback("sideview")
+            self.sideview_app = GStreamerDetectionApp(sideview_callback, user_data)
+            # Set source type for the pipeline
+            self.sideview_app.source_type = "sideview"
+            self.sideview_app.run()
+        except Exception as e:
+            print(f"❌ Error in sideview detection: {e}")
+
+    def run_sequential(self):
+        print(" Running SEQUENTIAL processing...")
+        print("\n" + "="*50)
+        print(" PROCESSING TOPVIEW FIRST")
+        print("="*50)
+        
+        self.run_topview()
+        
+        print("\n" + "="*50)
+        print(" PROCESSING SIDEVIEW SECOND")
+        print("="*50)
+        
+        self.run_sideview()
+
+    def run_parallel(self):
+        print(" Running PARALLEL processing...")
+        
+        self.topview_thread = threading.Thread(target=self.run_topview, name="TopviewThread")
+        self.sideview_thread = threading.Thread(target=self.run_sideview, name="SideviewThread")
+
+        print(" Starting both detection threads...")
+        self.topview_thread.start()
+        time.sleep(2)  # Small delay to avoid resource conflicts
+        self.sideview_thread.start()
+        
+        print(" Waiting for both threads to complete...")
+        self.topview_thread.join()
+        self.sideview_thread.join()
+        
+        print(" Both detection threads completed!")
+
+    def run_single(self, source_type="topview"):
+        print(f" Running SINGLE source: {source_type.upper()}")
+        
+        if source_type == "topview":
+            self.run_topview()
+        elif source_type == "sideview":
+            self.run_sideview()
+        else:
+            print(f" Invalid source type: {source_type}")
+
+    def stop(self):
+        if self.topview_app:
+            self.topview_app.stop()
+        if self.sideview_app:
+            self.sideview_app.stop()
+
+def main():
+    import sys
+    
+    app = DualSourceDetectionApp()
+    
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+        
+        if mode == "sequential":
+            app.run_sequential()
+        elif mode == "parallel":
+            app.run_parallel()
+        elif mode == "topview":
+            app.run_single("topview")
+        elif mode == "sideview":
+            app.run_single("sideview")
+        else:
+            print("❌ Invalid mode. Use: sequential, parallel, topview, or sideview")
+            sys.exit(1)
+    else:
+        print(" No mode specified, running sequential mode")
+        print(" Usage: python script.py [sequential|parallel|topview|sideview]")
+        app.run_sequential()
+
+if __name__ == "__main__":
+    main()
