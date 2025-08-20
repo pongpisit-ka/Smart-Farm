@@ -18,7 +18,7 @@ OUTPUT_PATH = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Bri
 os.makedirs(OUTPUT_PATH, exist_ok=True)
 
 class ImageDetectionProcessor:
-    def __init__(self, hef_path, config_path=None, function_name="smartfarm"):
+    def __init__(self, hef_path, config_path=None, function_name=None):
         # Initialize GStreamer
         Gst.init(None)
         self.hef_path = hef_path
@@ -31,22 +31,15 @@ class ImageDetectionProcessor:
         
     def create_pipeline(self):
         """Create GStreamer pipeline for image processing"""
-        # Build pipeline string
+        # Build pipeline string - ไม่ใช้ hailofilter
         pipeline_parts = [
             "appsrc name=source",
             "videoconvert",
             "videoscale",
             "video/x-raw,format=RGB,width=640,height=640",
             f"hailonet hef-path={self.hef_path}",
+            "appsink name=sink"
         ]
-        
-        # Add hailofilter with config if provided
-        if self.config_path and os.path.exists(self.config_path):
-            pipeline_parts.append(f"hailofilter function-name={self.function_name} config-path={self.config_path}")
-        else:
-            pipeline_parts.append(f"hailofilter function-name={self.function_name}")
-        
-        pipeline_parts.append("appsink name=sink")
         
         pipeline_str = " ! ".join(pipeline_parts)
         
@@ -83,22 +76,89 @@ class ImageDetectionProcessor:
             if sample:
                 buffer = sample.get_buffer()
                 
-                # Get detections
+                # Get detections from buffer
                 roi = hailo.get_roi_from_buffer(buffer)
-                detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+                
+                # Try different ways to get detections
+                detections = []
+                
+                # Method 1: Try HAILO_DETECTION
+                try:
+                    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+                except:
+                    pass
+                
+                # Method 2: Try getting all objects
+                if not detections:
+                    try:
+                        all_objects = roi.get_objects()
+                        detections = [obj for obj in all_objects if hasattr(obj, 'get_bbox')]
+                    except:
+                        pass
+                
+                # Method 3: Manual tensor parsing
+                if not detections:
+                    detections = self.parse_raw_detections(roi)
                 
                 if detections:
+                    print(f"Found {len(detections)} detections")
                     self.draw_detections_and_save(detections)
                 else:
                     print(f"No detections found in {self.current_filename}")
-                    # Save image without detections
                     self.save_image_without_detections()
                     
         except Exception as e:
             print(f"Error in on_new_sample: {e}")
+            import traceback
+            traceback.print_exc()
             self.save_image_without_detections()
             
         return Gst.FlowReturn.OK
+    
+    def parse_raw_detections(self, roi):
+        """Parse raw tensor data for detections"""
+        detections = []
+        try:
+            # Get tensor data
+            tensors = roi.get_tensors()
+            print(f"Found {len(tensors)} tensors")
+            
+            for i, tensor in enumerate(tensors):
+                print(f"Tensor {i}: shape={tensor.shape}, dtype={tensor.dtype}")
+                
+                # Assuming YOLO-like output format
+                if len(tensor.shape) >= 2:
+                    data = np.array(tensor)
+                    print(f"Tensor data shape: {data.shape}")
+                    
+                    # Try to parse as YOLO format [batch, detections, 5+classes]
+                    if len(data.shape) == 3 and data.shape[2] >= 5:
+                        batch_detections = data[0]  # Take first batch
+                        
+                        for detection in batch_detections:
+                            if len(detection) >= 5:
+                                conf = detection[4]
+                                if conf > 0.5:  # Confidence threshold
+                                    x_center, y_center, width, height = detection[:4]
+                                    
+                                    # Convert to bbox format
+                                    x1 = max(0, x_center - width/2)
+                                    y1 = max(0, y_center - height/2)
+                                    x2 = min(1, x_center + width/2)
+                                    y2 = min(1, y_center + height/2)
+                                    
+                                    # Create detection object
+                                    det = {
+                                        'bbox': [x1, y1, x2, y2],
+                                        'confidence': conf,
+                                        'label': 'object'
+                                    }
+                                    detections.append(det)
+                    
+        except Exception as e:
+            print(f"Error parsing raw detections: {e}")
+            
+        return detections
         
     def save_image_without_detections(self):
         """Save image without any detections"""
@@ -130,18 +190,33 @@ class ImageDetectionProcessor:
         detection_info = []
         
         for detection in detections:
-            bbox = detection.get_bbox()
-            label = detection.get_label()
-            confidence = detection.get_confidence()
+            # Handle different detection formats
+            if hasattr(detection, 'get_bbox'):
+                # Hailo detection object
+                bbox = detection.get_bbox()
+                label = detection.get_label()
+                confidence = detection.get_confidence()
+                
+                x1 = bbox.xmin()
+                y1 = bbox.ymin()
+                x2 = bbox.xmax()
+                y2 = bbox.ymax()
+            else:
+                # Dictionary format from raw parsing
+                bbox = detection['bbox']
+                label = detection.get('label', 'object')
+                confidence = detection['confidence']
+                
+                x1, y1, x2, y2 = bbox
             
             # Get image dimensions
             width, height = image.size
             
             # Calculate bounding box coordinates
-            x1 = int(bbox.xmin() * width)
-            y1 = int(bbox.ymin() * height)
-            x2 = int(bbox.xmax() * width)
-            y2 = int(bbox.ymax() * height)
+            x1 = int(x1 * width)
+            y1 = int(y1 * height)
+            x2 = int(x2 * width)
+            y2 = int(y2 * height)
             
             # Draw bounding box
             draw.rectangle([x1, y1, x2, y2], outline="blue", width=2)
@@ -185,7 +260,7 @@ class ImageDetectionProcessor:
             # Convert PIL image to numpy array
             img_array = np.array(self.current_image)
             
-            # Resize to model input size if needed
+            # Resize to model input size
             img_array = cv2.resize(img_array, (640, 640))
             
             # Convert to GStreamer buffer
@@ -248,14 +323,14 @@ class ImageDetectionProcessor:
             
             # Wait a bit for processing
             import time
-            time.sleep(0.5)
+            time.sleep(1.0)  # เพิ่มเวลารอ
         
         # Signal end of stream
         self.source.emit("end-of-stream")
         
         # Wait for EOS
         bus = self.pipeline.get_bus()
-        msg = bus.timed_pop_filtered(5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+        msg = bus.timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
         
         if msg:
             if msg.type == Gst.MessageType.ERROR:
@@ -268,12 +343,11 @@ class ImageDetectionProcessor:
         print(f"\nProcessing complete! Processed {self.processed_count} images.")
         print(f"Results saved to: {OUTPUT_PATH}")
 
-# Main function - ออกมาจาก class แล้ว
 def main():
     parser = argparse.ArgumentParser(description='Process images with Hailo smartfarm model')
     parser.add_argument('--hef-path', required=True, help='Path to HEF model file')
-    parser.add_argument('--config-path', help='Path to config JSON file')
-    parser.add_argument('--function-name', default='smartfarm', help='Post-processing function name')
+    parser.add_argument('--config-path', help='Path to config JSON file (optional)')
+    parser.add_argument('--function-name', help='Post-processing function name (optional)')
     
     args = parser.parse_args()
     
@@ -285,7 +359,8 @@ def main():
     print(f"Using HEF file: {args.hef_path}")
     if args.config_path:
         print(f"Using config file: {args.config_path}")
-    print(f"Using function name: {args.function_name}")
+    if args.function_name:
+        print(f"Using function name: {args.function_name}")
     
     # Create processor and run
     processor = ImageDetectionProcessor(
