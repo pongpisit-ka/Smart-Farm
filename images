@@ -1,0 +1,299 @@
+import os
+import glob
+import argparse
+from pathlib import Path
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+import hailo
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import cv2
+
+# Input and output paths
+INPUT_PATH = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_topview_smartfarm"
+OUTPUT_PATH = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_result_topview"
+
+# Ensure output directory exists
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+class ImageDetectionProcessor:
+    def __init__(self, hef_path, config_path=None, function_name="smartfarm"):
+        # Initialize GStreamer
+        Gst.init(None)
+        self.hef_path = hef_path
+        self.config_path = config_path
+        self.function_name = function_name
+        self.pipeline = None
+        self.current_image = None
+        self.current_filename = None
+        self.processed_count = 0
+        
+    def create_pipeline(self):
+        """Create GStreamer pipeline for image processing"""
+        # Build pipeline string
+        pipeline_parts = [
+            "appsrc name=source",
+            "videoconvert",
+            "videoscale",
+            "video/x-raw,format=RGB,width=640,height=640",
+            f"hailonet hef-path={self.hef_path}",
+        ]
+        
+        # Add hailofilter with config if provided
+        if self.config_path and os.path.exists(self.config_path):
+            pipeline_parts.append(f"hailofilter function-name={self.function_name} config-path={self.config_path}")
+        else:
+            pipeline_parts.append(f"hailofilter function-name={self.function_name}")
+        
+        pipeline_parts.append("appsink name=sink")
+        
+        pipeline_str = " ! ".join(pipeline_parts)
+        
+        print(f"Pipeline: {pipeline_str}")
+        
+        try:
+            self.pipeline = Gst.parse_launch(pipeline_str)
+        except Exception as e:
+            print(f"Error creating pipeline: {e}")
+            return False
+        
+        # Get elements
+        self.source = self.pipeline.get_by_name("source")
+        self.sink = self.pipeline.get_by_name("sink")
+        
+        if not self.source or not self.sink:
+            print("Failed to get pipeline elements")
+            return False
+        
+        # Configure appsrc
+        self.source.set_property("emit-signals", True)
+        self.source.set_property("is-live", True)
+        
+        # Configure appsink
+        self.sink.set_property("emit-signals", True)
+        self.sink.connect("new-sample", self.on_new_sample)
+        
+        return True
+        
+    def on_new_sample(self, sink):
+        """Callback when processed sample is available"""
+        try:
+            sample = sink.emit("pull-sample")
+            if sample:
+                buffer = sample.get_buffer()
+                
+                # Get detections
+                roi = hailo.get_roi_from_buffer(buffer)
+                detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+                
+                if detections:
+                    self.draw_detections_and_save(detections)
+                else:
+                    print(f"No detections found in {self.current_filename}")
+                    # Save image without detections
+                    self.save_image_without_detections()
+                    
+        except Exception as e:
+            print(f"Error in on_new_sample: {e}")
+            self.save_image_without_detections()
+            
+        return Gst.FlowReturn.OK
+        
+    def save_image_without_detections(self):
+        """Save image without any detections"""
+        if self.current_image is None:
+            return
+            
+        output_filename = f"result_{self.current_filename}"
+        output_path = os.path.join(OUTPUT_PATH, output_filename)
+        self.current_image.save(output_path)
+        
+        self.processed_count += 1
+        print(f"Processed {self.current_filename} -> {output_filename} (No detections)")
+        print(f"Image saved to: {output_path}\n")
+        
+    def draw_detections_and_save(self, detections):
+        """Draw bounding boxes and save image"""
+        if self.current_image is None:
+            return
+            
+        image = self.current_image.copy()
+        draw = ImageDraw.Draw(image)
+        
+        # Load font
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        except:
+            font = ImageFont.load_default()
+        
+        detection_info = []
+        
+        for detection in detections:
+            bbox = detection.get_bbox()
+            label = detection.get_label()
+            confidence = detection.get_confidence()
+            
+            # Get image dimensions
+            width, height = image.size
+            
+            # Calculate bounding box coordinates
+            x1 = int(bbox.xmin() * width)
+            y1 = int(bbox.ymin() * height)
+            x2 = int(bbox.xmax() * width)
+            y2 = int(bbox.ymax() * height)
+            
+            # Draw bounding box
+            draw.rectangle([x1, y1, x2, y2], outline="blue", width=2)
+            
+            # Prepare label text
+            text = f"{label} {confidence:.0%}"
+            
+            # Get text size for background
+            bbox_text = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox_text[2] - bbox_text[0]
+            text_height = bbox_text[3] - bbox_text[1]
+            
+            # Draw background for text
+            text_y = max(y1 - text_height - 5, 0)
+            draw.rectangle([x1, text_y, x1 + text_width + 10, text_y + text_height + 5], fill="blue")
+            
+            # Draw text
+            draw.text((x1 + 5, text_y + 2), text, fill="white", font=font)
+            
+            detection_info.append(f"Detection: {label} Confidence: {confidence:.2f} Box: ({x1},{y1},{x2},{y2})")
+        
+        # Save the processed image
+        output_filename = f"result_{self.current_filename}"
+        output_path = os.path.join(OUTPUT_PATH, output_filename)
+        image.save(output_path)
+        
+        self.processed_count += 1
+        
+        print(f"Processed {self.current_filename} -> {output_filename}")
+        for info in detection_info:
+            print(f"  {info}")
+        print(f"Image saved to: {output_path}\n")
+        
+    def process_image(self, image_path):
+        """Process a single image"""
+        try:
+            # Load image
+            self.current_image = Image.open(image_path).convert('RGB')
+            self.current_filename = os.path.basename(image_path)
+            
+            # Convert PIL image to numpy array
+            img_array = np.array(self.current_image)
+            
+            # Resize to model input size if needed
+            img_array = cv2.resize(img_array, (640, 640))
+            
+            # Convert to GStreamer buffer
+            height, width, channels = img_array.shape
+            
+            # Create caps
+            caps = Gst.Caps.from_string(f"video/x-raw,format=RGB,width={width},height={height},framerate=1/1")
+            
+            # Create buffer
+            buffer = Gst.Buffer.new_allocate(None, img_array.nbytes, None)
+            buffer.fill(0, img_array.tobytes())
+            
+            # Set caps on source
+            self.source.set_property("caps", caps)
+            
+            # Push buffer to pipeline
+            ret = self.source.emit("push-buffer", buffer)
+            
+            return ret == Gst.FlowReturn.OK
+            
+        except Exception as e:
+            print(f"Error processing {image_path}: {e}")
+            return False
+            
+    def process_folder(self):
+        """Process all images in the input folder"""
+        # Get all image files
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff']
+        image_files = []
+        
+        for extension in image_extensions:
+            image_files.extend(glob.glob(os.path.join(INPUT_PATH, extension)))
+            image_files.extend(glob.glob(os.path.join(INPUT_PATH, extension.upper())))
+        
+        if not image_files:
+            print(f"No image files found in {INPUT_PATH}")
+            return
+            
+        print(f"Found {len(image_files)} image files to process")
+        
+        # Create and start pipeline
+        if not self.create_pipeline():
+            print("Failed to create pipeline")
+            return
+            
+        # Set pipeline to playing state
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("Failed to start pipeline")
+            return
+        
+        # Wait for pipeline to be ready
+        self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+        
+        # Process each image
+        for image_path in sorted(image_files):
+            print(f"Processing: {os.path.basename(image_path)}")
+            if not self.process_image(image_path):
+                print(f"Failed to process {image_path}")
+            
+            # Wait a bit for processing
+            import time
+            time.sleep(0.5)
+        
+        # Signal end of stream
+        self.source.emit("end-of-stream")
+        
+        # Wait for EOS
+        bus = self.pipeline.get_bus()
+        msg = bus.timed_pop_filtered(5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+        
+        if msg:
+            if msg.type == Gst.MessageType.ERROR:
+                err, debug = msg.parse_error()
+                print(f"Pipeline error: {err.message}")
+        
+        # Cleanup
+        self.pipeline.set_state(Gst.State.NULL)
+        
+        print(f"\nProcessing complete! Processed {self.processed_count} images.")
+        print(f"Results saved to: {OUTPUT_PATH}")
+
+# Main function - ออกมาจาก class แล้ว
+def main():
+    parser = argparse.ArgumentParser(description='Process images with Hailo smartfarm model')
+    parser.add_argument('--hef-path', required=True, help='Path to HEF model file')
+    parser.add_argument('--config-path', help='Path to config JSON file')
+    parser.add_argument('--function-name', default='smartfarm', help='Post-processing function name')
+    
+    args = parser.parse_args()
+    
+    # Verify HEF file exists
+    if not os.path.exists(args.hef_path):
+        print(f"Error: HEF file not found: {args.hef_path}")
+        return
+    
+    print(f"Using HEF file: {args.hef_path}")
+    if args.config_path:
+        print(f"Using config file: {args.config_path}")
+    print(f"Using function name: {args.function_name}")
+    
+    # Create processor and run
+    processor = ImageDetectionProcessor(
+        hef_path=args.hef_path,
+        config_path=args.config_path,
+        function_name=args.function_name
+    )
+    processor.process_folder()
+
+if __name__ == "__main__":
+    main()
