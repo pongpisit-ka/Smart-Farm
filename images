@@ -1,4 +1,3 @@
-# region imports
 import os
 from pathlib import Path
 import gi
@@ -10,33 +9,24 @@ import hailo
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-# Hailo app imports
 from hailo_apps.hailo_app_python.core.common.installation_utils import detect_hailo_arch
 from hailo_apps.hailo_app_python.core.common.core import get_default_parser, get_resource_path
-from hailo_apps.hailo_app_python.core.common.defines import (
-    RESOURCES_VIDEOS_DIR_NAME, SIMPLE_DETECTION_VIDEO_NAME,
-    SIMPLE_DETECTION_APP_TITLE, SIMPLE_DETECTION_PIPELINE,
-    RESOURCES_MODELS_DIR_NAME, RESOURCES_SO_DIR_NAME,
-    SIMPLE_DETECTION_POSTPROCESS_SO_FILENAME, SIMPLE_DETECTION_POSTPROCESS_FUNCTION
-)
-from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines import (
-    INFERENCE_PIPELINE, USER_CALLBACK_PIPELINE
-)
-from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import (
-    GStreamerApp, app_callback_class
-)
-# endregion imports
+from hailo_apps.hailo_app_python.core.common.defines import RESOURCES_VIDEOS_DIR_NAME
+from hailo_apps.hailo_app_python.core.common.defines import SIMPLE_DETECTION_VIDEO_NAME
+from hailo_apps.hailo_app_python.core.common.defines import SIMPLE_DETECTION_APP_TITLE
+from hailo_apps.hailo_app_python.core.common.defines import SIMPLE_DETECTION_PIPELINE
+from hailo_apps.hailo_app_python.core.common.defines import RESOURCES_MODELS_DIR_NAME
+from hailo_apps.hailo_app_python.core.common.defines import RESOURCES_SO_DIR_NAME
+from hailo_apps.hailo_app_python.core.common.defines import SIMPLE_DETECTION_POSTPROCESS_SO_FILENAME
+from hailo_apps.hailo_app_python.core.common.defines import SIMPLE_DETECTION_POSTPROCESS_FUNCTION
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines import INFERENCE_PIPELINE
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines import USER_CALLBACK_PIPELINE
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import GStreamerApp
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callback_class
 
-# -----------------------------------------------------------------------------------------------
-# Config paths
-# -----------------------------------------------------------------------------------------------
-SOURCE_FOLDER = r"R:\01-Organize\01-Management\01-Data Center\Brisk\06-AI & Machine Learning (D0340)\04-IOT_Smartfarm\picture_topview_smartfarm"
-SAVE_PATH     = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_result_topview"
-os.makedirs(SAVE_PATH, exist_ok=True)
+SOURCE_FOLDER__TOPVIEW = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_topview_smartfarm"
+SOURCE_FOLDER__SIDEVIEW = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_sideview_smartfarm"
 
-# -----------------------------------------------------------------------------------------------
-# Utility: หาภาพล่าสุดในโฟลเดอร์
-# -----------------------------------------------------------------------------------------------
 def get_latest_image(folder_path: str) -> str:
     files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
              if f.lower().endswith((".jpg", ".jpeg", ".png"))]
@@ -45,16 +35,18 @@ def get_latest_image(folder_path: str) -> str:
     latest_file = max(files, key=os.path.getmtime)
     return latest_file
 
-# -----------------------------------------------------------------------------------------------
-# User Callback
-# -----------------------------------------------------------------------------------------------
 class user_app_callback_class(app_callback_class):
     def __init__(self):
         super().__init__()
+        self.current_source = "topview"  # Track current source
 
 def app_callback(pad, info, user_data):
     user_data.increment()
-    string_to_print = f"Frame count: {user_data.get_count()}\n"
+    frame_count = user_data.get_count()
+    
+    source_type = user_data.current_source
+    string_to_print = f" Frame {frame_count} ({source_type.upper()}): "
+    
     buffer = info.get_buffer()
     if buffer is None:
         return Gst.PadProbeReturn.OK
@@ -66,17 +58,8 @@ def app_callback(pad, info, user_data):
         structure = caps.get_structure(0)
         width = structure.get_value("width")
         height = structure.get_value("height")
-        data = buffer.extract_dup(0, buffer.get_size())
 
-        np_image = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
-        image = Image.fromarray(np_image)
-        draw = ImageDraw.Draw(image)
-
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        except:
-            font = ImageFont.load_default()
-
+        detection_results = []
         for detection in detections:
             bbox = detection.get_bbox()
             label = detection.get_label()
@@ -87,33 +70,27 @@ def app_callback(pad, info, user_data):
             x2 = int(bbox.xmax() * width)
             y2 = int(bbox.ymax() * height)
 
-            draw.rectangle([x1, y1, x2, y2], outline="blue", width=2)
+            detection_info = {
+                'label': label,
+                'confidence': confidence,
+                'bbox': (x1, y1, x2, y2),
+                'source': source_type
+            }
+            detection_results.append(detection_info)
 
-            text = f"{label} {confidence:.0%}"
-            bbox_text = draw.textbbox((0, 0), text, font=font)
-            text_width = bbox_text[2] - bbox_text[0]
-            text_height = bbox_text[3] - bbox_text[1]
+            string_to_print += f" {label} ({confidence:.0%}) "
 
-            text_y = max(y1 - text_height - 5, 0)
-            draw.rectangle([x1, text_y, x1 + text_width + 10, text_y + text_height + 5], fill="blue")
-            draw.text((x1 + 5, text_y + 2), text, fill="white", font=font)
-
-            string_to_print += (f"Detection: {label} Confidence: {confidence:.2f} "
-                                f"Box: ({x1},{y1},{x2},{y2})\n")
-
-        image_path = os.path.join(SAVE_PATH, f"result_topview_{user_data.get_count()}.jpg")
-        image.save(image_path)
-
-        string_to_print += f"Image saved to: {image_path}\n"
         print(string_to_print)
+        
+        # Print detailed detection info
+        for det in detection_results:
+            print(f"   {det['source'].upper()}: {det['label']} - Confidence: {det['confidence']:.2f} - Box: {det['bbox']}")
+            
     else:
-        print(f"Frame count: {user_data.get_count()} - No detections")
+        print(f"{string_to_print} No detections")
 
     return Gst.PadProbeReturn.OK
 
-# -----------------------------------------------------------------------------------------------
-# Custom GStreamer App (แก้ให้ใช้ image แทน video)
-# -----------------------------------------------------------------------------------------------
 class GStreamerDetectionApp(GStreamerApp):
     def __init__(self, app_callback, user_data, parser=None):
         if parser is None:
@@ -122,6 +99,12 @@ class GStreamerDetectionApp(GStreamerApp):
             "--labels-json",
             default=None,
             help="Path to custom labels JSON file",
+        )
+        parser.add_argument(
+            "--source-type",
+            choices=["topview", "sideview", "both"],
+            default="both",
+            help="Which source to process: topview, sideview, or both",
         )
         super().__init__(parser, user_data)
 
@@ -137,7 +120,7 @@ class GStreamerDetectionApp(GStreamerApp):
             if detected_arch is None:
                 raise ValueError("Could not auto-detect Hailo architecture. Please specify --arch manually.")
             self.arch = detected_arch
-            print(f"Auto-detected Hailo architecture: {self.arch}")
+            print(f" Auto-detected Hailo architecture: {self.arch}")
         else:
             self.arch = self.options_menu.arch
 
@@ -148,17 +131,18 @@ class GStreamerDetectionApp(GStreamerApp):
                 pipeline_name=SIMPLE_DETECTION_PIPELINE,
                 resource_type=RESOURCES_MODELS_DIR_NAME,
             )
-        print(f"Using HEF path: {self.hef_path}")
+        print(f" Using HEF path: {self.hef_path}")
 
         self.post_process_so = get_resource_path(
             pipeline_name=SIMPLE_DETECTION_PIPELINE,
             resource_type=RESOURCES_SO_DIR_NAME,
             model=SIMPLE_DETECTION_POSTPROCESS_SO_FILENAME
         )
-        print(f"Using post-process shared object: {self.post_process_so}")
+        print(f"⚙ Using post-process shared object: {self.post_process_so}")
 
         self.post_function_name = SIMPLE_DETECTION_POSTPROCESS_FUNCTION
         self.labels_json = self.options_menu.labels_json
+        self.source_type = self.options_menu.source_type
         self.app_callback = app_callback
         self.thresholds_str = (
             f"nms-score-threshold={nms_score_threshold} "
@@ -167,13 +151,49 @@ class GStreamerDetectionApp(GStreamerApp):
         )
 
         setproctitle.setproctitle(SIMPLE_DETECTION_APP_TITLE)
+        
+        if self.source_type == "both":
+            self.process_both_sources()
+        else:
+            self.create_pipeline()
+
+    def process_both_sources(self):
+        print(" Processing both sources...")
+        
+        print("\n === PROCESSING TOPVIEW ===")
+        self.user_data.current_source = "topview"
+        self.current_source_folder = SOURCE_FOLDER__TOPVIEW
         self.create_pipeline()
+        self.run()
+        
+        self.user_data = user_app_callback_class()
+        self.user_data.current_source = "sideview"
+        
+        print("\n === PROCESSING SIDEVIEW ===")
+        self.current_source_folder = SOURCE_FOLDER__SIDEVIEW
+        self.create_pipeline()
+        self.run()
 
     def get_pipeline_string(self):
-        latest_img = get_latest_image(SOURCE_FOLDER)
-        print(f"Using latest image: {latest_img}")
+        if hasattr(self, 'current_source_folder'):
+            source_folder = self.current_source_folder
+        elif self.source_type == "topview":
+            source_folder = SOURCE_FOLDER__TOPVIEW
+            self.user_data.current_source = "topview"
+        elif self.source_type == "sideview":
+            source_folder = SOURCE_FOLDER__SIDEVIEW
+            self.user_data.current_source = "sideview"
+        else:
+            source_folder = SOURCE_FOLDER__TOPVIEW  # Default
+            self.user_data.current_source = "topview"
 
-        # เปลี่ยนจาก SOURCE_PIPELINE → filesrc + decodebin
+        try:
+            latest_img = get_latest_image(source_folder)
+            print(f"Using latest image from {self.user_data.current_source}: {os.path.basename(latest_img)}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            raise
+
         source_pipeline = f"filesrc location=\"{latest_img}\" ! decodebin ! videoconvert"
 
         detection_pipeline = INFERENCE_PIPELINE(
@@ -191,19 +211,22 @@ class GStreamerDetectionApp(GStreamerApp):
             f"{detection_pipeline} ! "
             f"{user_callback_pipeline}"
         )
-        print("Pipeline:", pipeline_string)
+        print(f"Pipeline: {pipeline_string}")
         return pipeline_string
 
-# -----------------------------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------------------------
+    def run(self):
+        if self.source_type == "both":
+            super().run()
+        else:
+            super().run()
+
 if __name__ == "__main__":
     project_root = Path(__file__).resolve().parent.parent
-    env_file     = project_root / ".env"
+    env_file = project_root / ".env"
     os.environ["HAILO_ENV_FILE"] = str(env_file)
 
     user_data = user_app_callback_class()
     app = GStreamerDetectionApp(app_callback, user_data)
-    app.run()
-
-    print("✅ Processing finished. Check results in:", SAVE_PATH)
+    
+    if app.source_type != "both":
+        app.run()
