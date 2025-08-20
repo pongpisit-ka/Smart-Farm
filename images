@@ -1,494 +1,209 @@
+# region imports
 import os
-import glob
-import argparse
 from pathlib import Path
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+from gi.repository import Gst
+
+import setproctitle
 import hailo
-from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-import cv2
-import time
-import threading
+from PIL import Image, ImageDraw, ImageFont
 
-# Input and output paths
-INPUT_PATH = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_topview_smartfarm"
-OUTPUT_PATH = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_result_topview"
+# Hailo app imports
+from hailo_apps.hailo_app_python.core.common.installation_utils import detect_hailo_arch
+from hailo_apps.hailo_app_python.core.common.core import get_default_parser, get_resource_path
+from hailo_apps.hailo_app_python.core.common.defines import (
+    RESOURCES_VIDEOS_DIR_NAME, SIMPLE_DETECTION_VIDEO_NAME,
+    SIMPLE_DETECTION_APP_TITLE, SIMPLE_DETECTION_PIPELINE,
+    RESOURCES_MODELS_DIR_NAME, RESOURCES_SO_DIR_NAME,
+    SIMPLE_DETECTION_POSTPROCESS_SO_FILENAME, SIMPLE_DETECTION_POSTPROCESS_FUNCTION
+)
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines import (
+    INFERENCE_PIPELINE, USER_CALLBACK_PIPELINE
+)
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import (
+    GStreamerApp, app_callback_class
+)
+# endregion imports
 
-# Ensure output directory exists
-os.makedirs(OUTPUT_PATH, exist_ok=True)
+# -----------------------------------------------------------------------------------------------
+# Config paths
+# -----------------------------------------------------------------------------------------------
+SOURCE_FOLDER = r"R:\01-Organize\01-Management\01-Data Center\Brisk\06-AI & Machine Learning (D0340)\04-IOT_Smartfarm\picture_topview_smartfarm"
+SAVE_PATH     = "/home/brisk/netdrive/01-Organize/01-Management/01-Data Center/Brisk/06-AI & Machine Learning (D0340)/04-IOT_Smartfarm/picture_result_topview"
+os.makedirs(SAVE_PATH, exist_ok=True)
 
-class ImageDetectionProcessor:
-    def __init__(self, hef_path, labels_json=None, function_name=None):
-        # Initialize GStreamer
-        Gst.init(None)
-        self.hef_path = hef_path
-        self.labels_json = labels_json
-        self.function_name = function_name
-        self.pipeline = None
-        self.current_image = None
-        self.current_filename = None
-        self.processed_count = 0
-        self.processing_done = False
-        self.loop = None
-        
-        # Load labels if provided
-        self.labels = []
-        if labels_json and os.path.exists(labels_json):
-            import json
-            try:
-                with open(labels_json, 'r') as f:
-                    data = json.load(f)
-                    self.labels = data.get('labels', [])
-                print(f"Loaded {len(self.labels)} labels from {labels_json}")
-            except Exception as e:
-                print(f"Error loading labels: {e}")
-        
-    def create_pipeline(self):
-        """Create GStreamer pipeline for image processing"""
-        # Build hailonet element with function name if provided
-        hailonet_str = f"hailonet hef-path={self.hef_path}"
-        if self.function_name:
-            hailonet_str += f" function-name={self.function_name}"
-        
-        pipeline_str = (
-            "appsrc name=source ! "
-            "videoconvert ! "
-            "videoscale ! "
-            "video/x-raw,format=RGB,width=640,height=640 ! "
-            f"{hailonet_str} ! "
-            "appsink name=sink"
-        )
-        
-        print(f"Pipeline: {pipeline_str}")
-        
-        try:
-            self.pipeline = Gst.parse_launch(pipeline_str)
-            print("✅ Pipeline created successfully")
-        except Exception as e:
-            print(f"❌ Error creating pipeline: {e}")
-            return False
-        
-        # Get elements
-        self.source = self.pipeline.get_by_name("source")
-        self.sink = self.pipeline.get_by_name("sink")
-        
-        if not self.source or not self.sink:
-            print("❌ Failed to get pipeline elements")
-            return False
-        
-        print("✅ Pipeline elements obtained")
-        
-        # Configure appsrc
-        self.source.set_property("emit-signals", True)
-        self.source.set_property("is-live", False)
-        self.source.set_property("format", Gst.Format.TIME)
-        self.source.set_property("min-latency", 0)
-        self.source.set_property("max-latency", 0)
-        
-        # Configure appsink
-        self.sink.set_property("emit-signals", True)
-        self.sink.set_property("sync", False)
-        self.sink.set_property("max-buffers", 1)
-        self.sink.set_property("drop", True)
-        self.sink.connect("new-sample", self.on_new_sample)
-        
-        print("✅ Pipeline configured")
-        return True
-        
-    def on_new_sample(self, sink):
-        """Callback when processed sample is available"""
-        print(f"🔄 Processing sample for {self.current_filename}")
-        
-        try:
-            sample = sink.emit("pull-sample")
-            if sample:
-                buffer = sample.get_buffer()
-                print("✅ Buffer obtained from sample")
-                
-                # Get ROI from buffer
-                roi = hailo.get_roi_from_buffer(buffer)
-                print(f"✅ ROI obtained for {self.current_filename}")
-                
-                # Parse detections from raw tensor data
-                detections = self.parse_tensor_detections(roi)
-                
-                if detections:
-                    print(f"✅ Found {len(detections)} detections")
-                    self.draw_detections_and_save(detections)
-                else:
-                    print(f"⚠️ No detections found in {self.current_filename}")
-                    self.save_image_without_detections()
-                    
-            else:
-                print("❌ No sample available")
-                self.save_image_without_detections()
-                
-        except Exception as e:
-            print(f"❌ Error in on_new_sample: {e}")
-            import traceback
-            traceback.print_exc()
-            self.save_image_without_detections()
-        
-        # Signal that processing is done
-        self.processing_done = True
-        
-        # Quit the main loop
-        if self.loop:
-            self.loop.quit()
-            
-        return Gst.FlowReturn.OK
-    
-    def parse_tensor_detections(self, roi):
-        """Parse raw tensor data for detections"""
-        detections = []
-        try:
-            # Get all tensors from ROI
-            tensors = roi.get_tensors()
-            print(f"📊 Found {len(tensors)} tensors")
-            
-            for i, tensor in enumerate(tensors):
-                print(f"📊 Tensor {i}: name={tensor.name()}, shape={tensor.shape()}")
-                
-                # Get tensor data as numpy array
-                data = np.array(tensor, copy=False)
-                print(f"📊 Tensor {i} data shape: {data.shape}, dtype: {data.dtype}")
-                print(f"📊 Tensor {i} data range: min={data.min():.4f}, max={data.max():.4f}")
-                
-                # Try to parse different YOLO output formats
-                tensor_detections = self.parse_yolo_output(data, i)
-                detections.extend(tensor_detections)
-                print(f"📊 Tensor {i} yielded {len(tensor_detections)} detections")
-                    
-        except Exception as e:
-            print(f"❌ Error parsing tensor detections: {e}")
-            import traceback
-            traceback.print_exc()
-            
-        return detections
-    
-    def parse_yolo_output(self, data, tensor_idx):
-        """Parse YOLO-style output tensor"""
-        detections = []
-        
-        try:
-            original_shape = data.shape
-            print(f"🔍 Parsing tensor {tensor_idx} with shape {original_shape}")
-            
-            # Handle different tensor shapes
-            if len(data.shape) == 4:  # [batch, height, width, channels]
-                print(f"🔍 4D tensor detected, taking first batch")
-                data = data[0]  # Take first batch
-            
-            if len(data.shape) == 3:
-                h, w, c = data.shape
-                print(f"🔍 3D tensor: h={h}, w={w}, c={c}")
-                
-                # Check if this looks like YOLO grid output
-                if c > h and c > w and c % 3 == 0:
-                    # Likely format: [grid_h, grid_w, anchors*(5+classes)]
-                    print(f"🔍 Detected grid format, reshaping...")
-                    num_anchors = 3
-                    num_classes = (c // num_anchors) - 5
-                    
-                    if num_classes > 0:
-                        print(f"🔍 Detected {num_classes} classes with {num_anchors} anchors")
-                        data = data.reshape(-1, 5 + num_classes)
-                
-                # If still 3D, try flattening the spatial dimensions
-                elif len(data.shape) == 3:
-                    data = data.reshape(-1, data.shape[-1])
-            
-            # Handle 2D tensor format
-            if len(data.shape) == 2:
-                num_detections, num_features = data.shape
-                print(f"🔍 2D tensor: {num_detections} detections, {num_features} features")
-                
-                if num_features >= 5:  # At least x,y,w,h,conf
-                    for i, detection in enumerate(data):
-                        # YOLO format: [x_center, y_center, width, height, confidence, class_probs...]
-                        if len(detection) >= 5:
-                            x_center, y_center, width, height, obj_conf = detection[:5]
-                            
-                            # Get class probabilities
-                            class_probs = detection[5:] if len(detection) > 5 else [1.0]
-                            
-                            # Find best class
-                            if len(class_probs) > 0:
-                                class_id = np.argmax(class_probs)
-                                class_conf = class_probs[class_id]
-                                final_conf = obj_conf * class_conf
-                            else:
-                                class_id = 0
-                                final_conf = obj_conf
-                            
-                            # Apply confidence threshold
-                            if final_conf > 0.25:  # Lower threshold for testing
-                                # Convert to bbox format (normalized coordinates)
-                                x1 = max(0, x_center - width/2)
-                                y1 = max(0, y_center - height/2)
-                                x2 = min(1, x_center + width/2)
-                                y2 = min(1, y_center + height/2)
-                                
-                                # Skip invalid boxes
-                                if x2 > x1 and y2 > y1:
-                                    # Get label
-                                    if class_id < len(self.labels):
-                                        label = self.labels[class_id]
-                                    else:
-                                        label = f"class_{class_id}"
-                                    
-                                    detection_obj = {
-                                        'bbox': [x1, y1, x2, y2],
-                                        'confidence': final_conf,
-                                        'label': label,
-                                        'class_id': class_id
-                                    }
-                                    detections.append(detection_obj)
-                                    
-                                    print(f"🎯 Detection: {label} conf={final_conf:.3f} bbox=[{x1:.3f},{y1:.3f},{x2:.3f},{y2:.3f}]")
-            
-        except Exception as e:
-            print(f"❌ Error parsing YOLO output for tensor {tensor_idx}: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        return detections
-        
-    def save_image_without_detections(self):
-        """Save image without any detections"""
-        if self.current_image is None:
-            return
-            
-        output_filename = f"result_{self.current_filename}"
-        output_path = os.path.join(OUTPUT_PATH, output_filename)
-        self.current_image.save(output_path)
-        
-        self.processed_count += 1
-        print(f"✅ Processed {self.current_filename} -> {output_filename} (No detections)")
-        print(f"📁 Image saved to: {output_path}\n")
-        
-    def draw_detections_and_save(self, detections):
-        """Draw bounding boxes and save image"""
-        if self.current_image is None:
-            return
-            
-        image = self.current_image.copy()
+# -----------------------------------------------------------------------------------------------
+# Utility: หาภาพล่าสุดในโฟลเดอร์
+# -----------------------------------------------------------------------------------------------
+def get_latest_image(folder_path: str) -> str:
+    files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
+             if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    if not files:
+        raise FileNotFoundError(f"No images found in {folder_path}")
+    latest_file = max(files, key=os.path.getmtime)
+    return latest_file
+
+# -----------------------------------------------------------------------------------------------
+# User Callback
+# -----------------------------------------------------------------------------------------------
+class user_app_callback_class(app_callback_class):
+    def __init__(self):
+        super().__init__()
+
+def app_callback(pad, info, user_data):
+    user_data.increment()
+    string_to_print = f"Frame count: {user_data.get_count()}\n"
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+
+    detections = hailo.get_roi_from_buffer(buffer).get_objects_typed(hailo.HAILO_DETECTION)
+
+    if detections:
+        caps = pad.get_current_caps()
+        structure = caps.get_structure(0)
+        width = structure.get_value("width")
+        height = structure.get_value("height")
+        data = buffer.extract_dup(0, buffer.get_size())
+
+        np_image = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+        image = Image.fromarray(np_image)
         draw = ImageDraw.Draw(image)
-        
-        # Load font
+
         try:
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
         except:
             font = ImageFont.load_default()
-        
-        detection_info = []
-        
+
         for detection in detections:
-            bbox = detection['bbox']
-            label = detection['label']
-            confidence = detection['confidence']
-            
-            # Get image dimensions
-            width, height = image.size
-            
-            # Calculate bounding box coordinates
-            x1 = int(bbox[0] * width)
-            y1 = int(bbox[1] * height)
-            x2 = int(bbox[2] * width)
-            y2 = int(bbox[3] * height)
-            
-            # Ensure coordinates are within image bounds
-            x1 = max(0, min(x1, width-1))
-            y1 = max(0, min(y1, height-1))
-            x2 = max(0, min(x2, width-1))
-            y2 = max(0, min(y2, height-1))
-            
-            # Skip invalid boxes
-            if x2 <= x1 or y2 <= y1:
-                continue
-            
-            # Draw bounding box
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-            
-            # Prepare label text
+            bbox = detection.get_bbox()
+            label = detection.get_label()
+            confidence = detection.get_confidence()
+
+            x1 = int(bbox.xmin() * width)
+            y1 = int(bbox.ymin() * height)
+            x2 = int(bbox.xmax() * width)
+            y2 = int(bbox.ymax() * height)
+
+            draw.rectangle([x1, y1, x2, y2], outline="blue", width=2)
+
             text = f"{label} {confidence:.0%}"
-            
-            # Get text size for background
             bbox_text = draw.textbbox((0, 0), text, font=font)
             text_width = bbox_text[2] - bbox_text[0]
             text_height = bbox_text[3] - bbox_text[1]
-            
-            # Draw background for text
+
             text_y = max(y1 - text_height - 5, 0)
-            draw.rectangle([x1, text_y, x1 + text_width + 10, text_y + text_height + 5], fill="red")
-            
-            # Draw text
+            draw.rectangle([x1, text_y, x1 + text_width + 10, text_y + text_height + 5], fill="blue")
             draw.text((x1 + 5, text_y + 2), text, fill="white", font=font)
-            
-            detection_info.append(f"Detection: {label} Confidence: {confidence:.3f} Box: ({x1},{y1},{x2},{y2})")
-        
-        # Save the processed image
-        output_filename = f"result_{self.current_filename}"
-        output_path = os.path.join(OUTPUT_PATH, output_filename)
-        image.save(output_path)
-        
-        self.processed_count += 1
-        
-        print(f"✅ Processed {self.current_filename} -> {output_filename}")
-        for info in detection_info:
-            print(f"  🎯 {info}")
-        print(f"📁 Image saved to: {output_path}\n")
-        
-    def process_image(self, image_path):
-        """Process a single image"""
-        try:
-            # Load image
-            self.current_image = Image.open(image_path).convert('RGB')
-            self.current_filename = os.path.basename(image_path)
-            
-            print(f"📸 Loading image: {self.current_filename} - Size: {self.current_image.size}")
-            
-            # Convert PIL image to numpy array
-            img_array = np.array(self.current_image)
-            
-            # Resize to model input size (640x640)
-            img_array = cv2.resize(img_array, (640, 640))
-            
-            # Convert to GStreamer buffer
-            height, width, channels = img_array.shape
-            
-            # Create caps
-            caps = Gst.Caps.from_string(f"video/x-raw,format=RGB,width={width},height={height},framerate=1/1")
-            
-            # Create buffer
-            buffer = Gst.Buffer.new_allocate(None, img_array.nbytes, None)
-            buffer.fill(0, img_array.tobytes())
-            
-            # Add timestamp
-            buffer.pts = 0
-            buffer.dts = 0
-            buffer.duration = Gst.SECOND
-            
-            # Set caps on source
-            self.source.set_property("caps", caps)
-            
-            # Reset processing flag
-            self.processing_done = False
-            
-            # Push buffer to pipeline
-            ret = self.source.emit("push-buffer", buffer)
-            print(f"📤 Buffer pushed, return: {ret}")
-            
-            return ret == Gst.FlowReturn.OK
-            
-        except Exception as e:
-            print(f"❌ Error processing {image_path}: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-            
-    def process_folder(self):
-        """Process all images in the input folder"""
-        # Get all image files
-        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff']
-        image_files = []
-        
-        for extension in image_extensions:
-            image_files.extend(glob.glob(os.path.join(INPUT_PATH, extension)))
-            image_files.extend(glob.glob(os.path.join(INPUT_PATH, extension.upper())))
-        
-        if not image_files:
-            print(f"❌ No image files found in {INPUT_PATH}")
-            return
-            
-        print(f"📁 Found {len(image_files)} image files to process")
-        
-        # Create and start pipeline
-        if not self.create_pipeline():
-            print("❌ Failed to create pipeline")
-            return
-            
-        # Set pipeline to playing state
-        print("🚀 Starting pipeline...")
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            print("❌ Failed to start pipeline")
-            return
-        
-        # Wait for pipeline to be ready with timeout
-        print("⏳ Waiting for pipeline to be ready...")
-        state_ret = self.pipeline.get_state(5 * Gst.SECOND)  # 5 second timeout
-        if state_ret[0] != Gst.StateChangeReturn.SUCCESS:
-            print(f"⚠️ Pipeline state change result: {state_ret[0]}")
+
+            string_to_print += (f"Detection: {label} Confidence: {confidence:.2f} "
+                                f"Box: ({x1},{y1},{x2},{y2})\n")
+
+        image_path = os.path.join(SAVE_PATH, f"result_topview_{user_data.get_count()}.jpg")
+        image.save(image_path)
+
+        string_to_print += f"Image saved to: {image_path}\n"
+        print(string_to_print)
+    else:
+        print(f"Frame count: {user_data.get_count()} - No detections")
+
+    return Gst.PadProbeReturn.OK
+
+# -----------------------------------------------------------------------------------------------
+# Custom GStreamer App (แก้ให้ใช้ image แทน video)
+# -----------------------------------------------------------------------------------------------
+class GStreamerDetectionApp(GStreamerApp):
+    def __init__(self, app_callback, user_data, parser=None):
+        if parser is None:
+            parser = get_default_parser()
+        parser.add_argument(
+            "--labels-json",
+            default=None,
+            help="Path to custom labels JSON file",
+        )
+        super().__init__(parser, user_data)
+
+        self.video_width = 640
+        self.video_height = 360
+        self.batch_size = 1
+
+        nms_score_threshold = 0.3
+        nms_iou_threshold = 0.45
+
+        if self.options_menu.arch is None:
+            detected_arch = detect_hailo_arch()
+            if detected_arch is None:
+                raise ValueError("Could not auto-detect Hailo architecture. Please specify --arch manually.")
+            self.arch = detected_arch
+            print(f"Auto-detected Hailo architecture: {self.arch}")
         else:
-            print("✅ Pipeline is ready")
-        
-        # Process each image
-        for i, image_path in enumerate(sorted(image_files)):
-            print(f"\n--- 🖼️ Processing image {i+1}/{len(image_files)}: {os.path.basename(image_path)} ---")
-            
-            if not self.process_image(image_path):
-                print(f"❌ Failed to process {image_path}")
-                continue
-            
-            # Create main loop for this image
-            self.loop = GLib.MainLoop()
-            
-            # Set timeout for processing
-            def timeout_callback():
-                print("⏰ Processing timeout, moving to next image")
-                if self.loop:
-                    self.loop.quit()
-                return False
-            
-            GLib.timeout_add_seconds(10, timeout_callback)  # 10 second timeout
-            
-            # Run main loop until processing is done
-            print("🔄 Starting processing loop...")
-            self.loop.run()
-            
-            if not self.processing_done:
-                print("⚠️ Processing did not complete, saving original image")
-                self.save_image_without_detections()
-        
-        # Signal end of stream
-        print("🏁 Signaling end of stream...")
-        self.source.emit("end-of-stream")
-        
-        # Cleanup
-        self.pipeline.set_state(Gst.State.NULL)
-        
-        print(f"\n🎉 Processing complete! Processed {self.processed_count} images.")
-        print(f"📁 Results saved to: {OUTPUT_PATH}")
+            self.arch = self.options_menu.arch
 
-def main():
-    parser = argparse.ArgumentParser(description='Process images with Hailo smartfarm model')
-    parser.add_argument('--hef-path', required=True, help='Path to HEF model file')
-    parser.add_argument('--labels-json', help='Path to labels JSON file')
-    parser.add_argument('--function-name', help='Function name for hailonet')
-    
-    args = parser.parse_args()
-    
-    # Verify HEF file exists
-    if not os.path.exists(args.hef_path):
-        print(f"❌ Error: HEF file not found: {args.hef_path}")
-        return
-    
-    print(f"🤖 Using HEF file: {args.hef_path}")
-    if args.labels_json:
-        print(f"🏷️ Using labels file: {args.labels_json}")
-    if args.function_name:
-        print(f"⚙️ Using function name: {args.function_name}")
-    
-    # Create processor and run
-    processor = ImageDetectionProcessor(
-        hef_path=args.hef_path,
-        labels_json=args.labels_json,
-        function_name=args.function_name
-    )
-    processor.process_folder()
+        if self.options_menu.hef_path is not None:
+            self.hef_path = self.options_menu.hef_path
+        else:
+            self.hef_path = get_resource_path(
+                pipeline_name=SIMPLE_DETECTION_PIPELINE,
+                resource_type=RESOURCES_MODELS_DIR_NAME,
+            )
+        print(f"Using HEF path: {self.hef_path}")
 
+        self.post_process_so = get_resource_path(
+            pipeline_name=SIMPLE_DETECTION_PIPELINE,
+            resource_type=RESOURCES_SO_DIR_NAME,
+            model=SIMPLE_DETECTION_POSTPROCESS_SO_FILENAME
+        )
+        print(f"Using post-process shared object: {self.post_process_so}")
+
+        self.post_function_name = SIMPLE_DETECTION_POSTPROCESS_FUNCTION
+        self.labels_json = self.options_menu.labels_json
+        self.app_callback = app_callback
+        self.thresholds_str = (
+            f"nms-score-threshold={nms_score_threshold} "
+            f"nms-iou-threshold={nms_iou_threshold} "
+            f"output-format-type=HAILO_FORMAT_TYPE_FLOAT32"
+        )
+
+        setproctitle.setproctitle(SIMPLE_DETECTION_APP_TITLE)
+        self.create_pipeline()
+
+    def get_pipeline_string(self):
+        latest_img = get_latest_image(SOURCE_FOLDER)
+        print(f"Using latest image: {latest_img}")
+
+        # เปลี่ยนจาก SOURCE_PIPELINE → filesrc + decodebin
+        source_pipeline = f"filesrc location=\"{latest_img}\" ! decodebin ! videoconvert"
+
+        detection_pipeline = INFERENCE_PIPELINE(
+            hef_path=self.hef_path,
+            post_process_so=self.post_process_so,
+            post_function_name=self.post_function_name,
+            batch_size=self.batch_size,
+            config_json=self.labels_json,
+            additional_params=self.thresholds_str
+        )
+        user_callback_pipeline = USER_CALLBACK_PIPELINE()
+
+        pipeline_string = (
+            f"{source_pipeline} ! "
+            f"{detection_pipeline} ! "
+            f"{user_callback_pipeline}"
+        )
+        print("Pipeline:", pipeline_string)
+        return pipeline_string
+
+# -----------------------------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    project_root = Path(__file__).resolve().parent.parent
+    env_file     = project_root / ".env"
+    os.environ["HAILO_ENV_FILE"] = str(env_file)
+
+    user_data = user_app_callback_class()
+    app = GStreamerDetectionApp(app_callback, user_data)
+    app.run()
+
+    print("✅ Processing finished. Check results in:", SAVE_PATH)
